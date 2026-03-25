@@ -7,11 +7,49 @@
     <groupId>com.orderSystem</groupId>
     <artifactId>event-driven-order-system</artifactId>
     <version>1.0-SNAPSHOT</version>
+    <packaging>pom</packaging>
+
+    <description>
+        A production-grade microservices project demonstrating event-driven architecture
+        using Apache Kafka, Spring Boot, and PostgreSQL.
+    </description>
+
+    <modules>
+        <module>shared-events</module>
+        <module>order-service</module>
+        <module>payment-service</module>
+        <module>notification-service</module>
+    </modules>
 
     <properties>
         <maven.compiler.source>22</maven.compiler.source>
         <maven.compiler.target>22</maven.compiler.target>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <spring-boot.version>3.3.0</spring-boot.version>
+        <testcontainers.version>1.19.8</testcontainers.version>
     </properties>
-    
+
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.boot</groupId>
+                <artifactId>spring-boot-dependencies</artifactId>
+                <version>${spring-boot.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>org.testcontainers</groupId>
+                <artifactId>testcontainers-bom</artifactId>
+                <version>${testcontainers.version}</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+            <dependency>
+                <groupId>com.orderSystem</groupId>
+                <artifactId>shared-events</artifactId>
+                <version>1.0-SNAPSHOT</version>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
 </project>
