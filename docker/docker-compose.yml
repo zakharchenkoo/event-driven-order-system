@@ -1,0 +1,292 @@
+# =============================================================================
+# Event-Driven Order System — Docker Compose
+# =============================================================================
+# Services:
+#   - kafka               : Message broker (KRaft mode - no Zookeeper needed)
+#   - kafka-ui            : Web UI to monitor Kafka topics and messages
+#   - order-db            : PostgreSQL database for Order Service
+#   - payment-db          : PostgreSQL database for Payment Service
+#   - order-service       : Order Service (scalable, multiple instances)
+#   - nginx               : Load balancer in front of Order Service instances
+#   - payment-service     : Payment Service (Kafka consumer + producer)
+#   - notification-service: Notification Service (Kafka consumer)
+#
+# Scaling:
+#   docker compose up -d --scale order-service=3
+#
+# Access points:
+#   - Order Service API    → http://localhost:8084  (via Nginx)
+#   - Payment Service      → http://localhost:8082
+#   - Notification Service → http://localhost:8083
+#   - Kafka UI             → http://localhost:8090
+# =============================================================================
+
+networks:
+  order-system-net:
+    driver: bridge
+
+volumes:
+  order-db-data:
+  payment-db-data:
+  kafka-data:
+
+services:
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Kafka — Message Broker (KRaft Mode)
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Key KRaft environment variables:
+  #   KAFKA_NODE_ID                  — unique broker ID
+  #   KAFKA_PROCESS_ROLES            — this node acts as both broker and controller
+  #   KAFKA_CONTROLLER_QUORUM_VOTERS — list of controller voters: id@host:port
+  #   CLUSTER_ID                     — fixed base64 cluster ID (generated once)
+  #
+  # Two listener configurations:
+  #   - PLAINTEXT://kafka:29092       → for containers inside Docker network
+  #   - PLAINTEXT_HOST://localhost:9092 → for apps on the host machine (IntelliJ etc.)
+  # ─────────────────────────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: kafka
+    networks:
+      - order-system-net
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://0.0.0.0:9092,CONTROLLER://kafka:29093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_MIN_INSYNC_REPLICAS: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_MESSAGE_MAX_BYTES: 1048576
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: [ "CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092" ]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Kafka UI — Web Interface for Kafka Monitoring
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Browser-based dashboard to inspect topics, partitions,
+  # consumer groups, and messages. Useful for debugging and demos.
+  # Access at: http://localhost:8090
+  # ─────────────────────────────────────────────────────────────────────────────
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: kafka-ui
+    networks:
+      - order-system-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # PostgreSQL — Order Service Database
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Stores orders and outbox_events tables.
+  # Isolated from payment-db — each service owns its own database
+  # (Database-per-Service pattern).
+  # Access: localhost:5432
+  # ─────────────────────────────────────────────────────────────────────────────
+  order-db:
+    image: postgres:16-alpine
+    container_name: order-db
+    networks:
+      - order-system-net
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: order_db
+      POSTGRES_USER: order_user
+      POSTGRES_PASSWORD: order_pass
+    volumes:
+      - order-db-data:/var/lib/postgresql/data
+      - ../order-service/src/main/resources/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U order_user -d order_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # PostgreSQL — Payment Service Database
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Stores payments table with idempotency key.
+  # Access: localhost:5433 (mapped to 5433 to avoid conflict with order-db)
+  # ─────────────────────────────────────────────────────────────────────────────
+  payment-db:
+    image: postgres:16-alpine
+    container_name: payment-db
+    networks:
+      - order-system-net
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: payment_db
+      POSTGRES_USER: payment_user
+      POSTGRES_PASSWORD: payment_pass
+    volumes:
+      - payment-db-data:/var/lib/postgresql/data
+      - ../payment-service/src/main/resources/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment_user -d payment_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Order Service — Scalable REST API
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Accepts incoming orders via REST, persists them to order-db,
+  # and publishes OrderCreatedEvents to Kafka via the Transactional Outbox Pattern.
+  #
+  # No ports exposed directly — all traffic goes through Nginx load balancer.
+  # Environment variables override application.yml values at runtime so the
+  # same Docker image works in any environment (dev, staging, prod).
+  #
+  # Important: container_name is intentionally omitted — Docker cannot assign
+  # the same name to multiple containers, which would break scaling.
+  #
+  # Race condition protection: OutboxRelayService uses FOR UPDATE SKIP LOCKED
+  # so multiple instances safely process different outbox events in parallel.
+  #
+  # Default: 1 instance
+  # Scale up:   docker compose up -d --scale order-service=3
+  # Scale down: docker compose up -d --scale order-service=1
+  # ─────────────────────────────────────────────────────────────────────────────
+  order-service:
+    build:
+      context: ..                       # root of the project (parent pom.xml)
+      dockerfile: order-service/Dockerfile
+    networks:
+      - order-system-net
+    depends_on:
+      order-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    environment:
+      SERVER_PORT: 8081
+      SPRING_DATASOURCE_URL: jdbc:postgresql://order-db:5432/order_db
+      SPRING_DATASOURCE_USERNAME: order_user
+      SPRING_DATASOURCE_PASSWORD: order_pass
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092     # internal Kafka listener
+      SPRING_JPA_HIBERNATE_DDL_AUTO: validate         # schema managed by schema.sql
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Nginx — Load Balancer for Order Service
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Acts as a reverse proxy in front of all Order Service instances.
+  # Distributes incoming requests in round-robin across all replicas.
+  # Docker's internal DNS automatically resolves "order-service" to all
+  # running container IPs, so Nginx always stays up to date when instances
+  # are added or removed.
+  #
+  # All external traffic enters at:  http://localhost:8084
+  # Nginx forwards it to one of:     http://order-service:8081 (any replica)
+  # ─────────────────────────────────────────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: nginx
+    networks:
+      - order-system-net
+    ports:
+      - "8084:80"                       # single entry point exposed to host
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro   # mount config as read-only
+    depends_on:
+      - order-service
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Payment Service — Kafka Consumer + Producer
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Listens on the order.created Kafka topic.
+  # Processes payments with idempotency protection (source_event_id UNIQUE key).
+  # Publishes PaymentCompletedEvent to the payment.completed topic.
+  # Uses FixedBackOff retry (3 retries, 2s delay) with DLQ on exhaustion.
+  # Access at: http://localhost:8082/actuator/health
+  # ─────────────────────────────────────────────────────────────────────────────
+  payment-service:
+    build:
+      context: ..                       # root of the project (parent pom.xml)
+      dockerfile: payment-service/Dockerfile
+    container_name: payment-service
+    networks:
+      - order-system-net
+    depends_on:
+      payment-db:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8082:8082"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://payment-db:5432/payment_db
+      SPRING_DATASOURCE_USERNAME: payment_user
+      SPRING_DATASOURCE_PASSWORD: payment_pass
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: payment-service-group
+      SPRING_JPA_HIBERNATE_DDL_AUTO: validate         # schema managed by schema.sql
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Notification Service — Kafka Consumer
+  # ─────────────────────────────────────────────────────────────────────────────
+  # Listens on the payment.completed Kafka topic.
+  # Sends simulated email notifications for both SUCCESS and FAILED payments.
+  # Uses ExponentialBackOff retry (2s → 4s → 8s) with DLQ on exhaustion.
+  # No database — stateless service, no JPA configuration needed.
+  # Access at: http://localhost:8083/actuator/health
+  # ─────────────────────────────────────────────────────────────────────────────
+  notification-service:
+    build:
+      context: ..                       # root of the project (parent pom.xml)
+      dockerfile: notification-service/Dockerfile
+    container_name: notification-service
+    networks:
+      - order-system-net
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+    environment:
+      SPRING_KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      SPRING_KAFKA_CONSUMER_GROUP_ID: notification-service-group
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
